@@ -1,6 +1,6 @@
 export type Orientation = 'horizontal' | 'vertical';
 
-export type OpponentType = 'huntTarget' | 'probability' | 'aiNano';
+export type OpponentType = 'huntTarget' | 'probability';
 
 export type GamePhase = 'setup' | 'playing' | 'finished';
 
@@ -60,16 +60,9 @@ export type AvailabilityState =
   | 'downloading'
   | 'unavailable';
 
-export interface AiMove {
-  row: number;
-  col: number;
-  reasoning: string;
-  fromFallback?: boolean;
-}
-
 export interface TranscriptEntry {
   id: string;
-  kind: 'ai-move' | 'ai-event' | 'bot-move' | 'system';
+  kind: 'bot-move' | 'system' | 'ai-banter';
   text: string;
   timestamp: number;
 }

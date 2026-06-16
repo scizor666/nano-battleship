@@ -6,13 +6,26 @@ export interface Settings {
   opponent: OpponentType;
   muted: boolean;
   reducedMotion: boolean;
+  commentary: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
   opponent: 'huntTarget',
   muted: false,
   reducedMotion: false,
+  commentary: false,
 };
+
+const VALID_OPPONENTS: ReadonlySet<OpponentType> = new Set([
+  'huntTarget',
+  'probability',
+]);
+
+function normalizeOpponent(value: unknown): OpponentType {
+  return VALID_OPPONENTS.has(value as OpponentType)
+    ? (value as OpponentType)
+    : DEFAULT_SETTINGS.opponent;
+}
 
 export function loadSettings(): Settings {
   try {
@@ -20,9 +33,11 @@ export function loadSettings(): Settings {
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<Settings>;
     return {
-      opponent: parsed.opponent ?? DEFAULT_SETTINGS.opponent,
+      // Migrate any retired opponent (e.g. the old "aiNano" player) to a valid one.
+      opponent: normalizeOpponent(parsed.opponent),
       muted: parsed.muted ?? DEFAULT_SETTINGS.muted,
       reducedMotion: parsed.reducedMotion ?? DEFAULT_SETTINGS.reducedMotion,
+      commentary: parsed.commentary ?? DEFAULT_SETTINGS.commentary,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -31,14 +46,4 @@ export function loadSettings(): Settings {
 
 export function saveSettings(settings: Settings): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-}
-
-export function resolveOpponent(
-  preferred: OpponentType,
-  aiAvailable: boolean,
-): OpponentType {
-  if (preferred === 'aiNano' && !aiAvailable) {
-    return 'huntTarget';
-  }
-  return preferred;
 }

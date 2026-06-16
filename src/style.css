@@ -210,6 +210,28 @@ button {
   color: var(--muted);
 }
 
+.commentary-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  cursor: pointer;
+}
+
+.commentary-toggle input {
+  margin-top: 0.2rem;
+}
+
+.commentary-toggle small {
+  color: var(--muted);
+  display: block;
+}
+
+.commentary-toggle.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .status-text {
   font-size: 1.05rem;
   font-weight: 600;
@@ -295,14 +317,13 @@ button {
   border-radius: 8px;
   background: #18243a;
   font-size: 0.92rem;
+  overflow-wrap: anywhere;
 }
 
-.transcript-entry.ai-event {
-  color: #ffd27a;
-}
-
-.transcript-entry.ai-move {
-  color: #b9d4ff;
+.transcript-entry.ai-banter {
+  color: #ffe27a;
+  background: #20283f;
+  font-style: italic;
 }
 
 .empty-log,

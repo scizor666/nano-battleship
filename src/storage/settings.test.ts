@@ -1,9 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import {
-  loadSettings,
-  resolveOpponent,
-  saveSettings,
-} from './settings.ts';
+import { loadSettings, saveSettings } from './settings.ts';
 
 const STORAGE_KEY = 'nano-battleship-settings';
 
@@ -17,6 +13,7 @@ describe('settings', () => {
       opponent: 'huntTarget',
       muted: false,
       reducedMotion: false,
+      commentary: false,
     });
   });
 
@@ -25,18 +22,22 @@ describe('settings', () => {
       opponent: 'probability',
       muted: true,
       reducedMotion: true,
+      commentary: true,
     });
     expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull();
     expect(loadSettings()).toEqual({
       opponent: 'probability',
       muted: true,
       reducedMotion: true,
+      commentary: true,
     });
   });
 
-  it('falls back from aiNano when unavailable', () => {
-    expect(resolveOpponent('aiNano', false)).toBe('huntTarget');
-    expect(resolveOpponent('aiNano', true)).toBe('aiNano');
-    expect(resolveOpponent('probability', false)).toBe('probability');
+  it('migrates a retired opponent to the default', () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ opponent: 'aiNano', muted: false, reducedMotion: false, commentary: true }),
+    );
+    expect(loadSettings().opponent).toBe('huntTarget');
   });
 });

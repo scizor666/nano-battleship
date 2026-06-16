@@ -21,7 +21,7 @@ import {
   huntTargetChooseMove,
 } from '../bots/huntTarget.ts';
 import { remainingShipSizes } from '../model/fleet.ts';
-import { AiNanoOpponent } from '../ai/opponent.ts';
+import { NanoCommentator } from '../ai/commentary.ts';
 import {
   checkAvailability,
   ensureModelReady,
@@ -29,7 +29,6 @@ import {
 } from '../ai/availability.ts';
 import {
   loadSettings,
-  resolveOpponent,
   saveSettings,
   type Settings,
 } from '../storage/settings.ts';
@@ -71,33 +70,89 @@ export function createApp(root: HTMLElement): void {
     downloadProgress: null,
   };
 
-  let state = createInitialState(resolveOpponent(settings.opponent, false));
+  let state = createInitialState(settings.opponent);
   let selectedShipSpec: ShipSpec | null = null;
   let placementOrientation: Orientation = 'horizontal';
   let placementPreview: Coordinate | null = null;
   let focusedEnemyCell: Coordinate = { row: 0, col: 0 };
   let huntState = createHuntTargetState();
   let transcript: TranscriptEntry[] = [];
-  let aiThinking = false;
   let opponentBusy = false;
 
-  const aiOpponent = new AiNanoOpponent({
-    onTranscript(entry) {
-      transcript = [...transcript, entry];
+  const commentator = new NanoCommentator();
+  let commentaryReady = false;
+
+  function addBanter(text: string): void {
+    transcript = [
+      ...transcript,
+      {
+        id: crypto.randomUUID(),
+        kind: 'ai-banter',
+        text: `🦆 ${text}`,
+        timestamp: Date.now(),
+      },
+    ];
+    render();
+  }
+
+  function maybeComment(
+    actor: 'player' | 'opponent',
+    result: import('../types/game.ts').ShotResult,
+    coordLabel: string,
+  ): void {
+    if (!settings.commentary || !commentaryReady || commentator.isBusy()) return;
+    // Fire-and-forget so the duck never slows the game down.
+    void commentator
+      .comment({ actor, result, coordLabel })
+      .then((quip) => addBanter(quip));
+  }
+
+  async function startCommentator(): Promise<void> {
+    if (!settings.commentary || availability.state !== 'available') {
+      commentaryReady = false;
+      return;
+    }
+    await commentator.start();
+    commentaryReady = true;
+  }
+
+  async function setCommentary(enabled: boolean): Promise<void> {
+    settings.commentary = enabled;
+    saveSettings(currentSettings());
+
+    if (!enabled) {
+      commentator.reset();
+      commentaryReady = false;
       render();
-    },
-    onThinking(thinking) {
-      aiThinking = thinking;
-      render();
-    },
-  });
+      return;
+    }
+
+    try {
+      if (availability.state === 'downloadable' || availability.state === 'downloading') {
+        aiStatusEl.textContent = 'Preparing on-device model...';
+        await ensureModelReady((progress) => {
+          availability = { ...availability, downloadProgress: progress, state: 'downloading' };
+          render();
+        });
+        availability = { ...availability, state: 'available', downloadProgress: 100 };
+      }
+      await startCommentator();
+    } catch (error) {
+      aiStatusEl.textContent =
+        error instanceof Error ? error.message : 'Failed to prepare AI commentary.';
+      settings.commentary = false;
+      commentaryReady = false;
+      saveSettings(currentSettings());
+    }
+    render();
+  }
 
   root.innerHTML = `
     <div class="app-shell">
       <header class="app-header">
         <div>
           <h1>Nano Battleship</h1>
-          <p class="subtitle">Classic Battleship with an on-device AI opponent via Chrome's Prompt API (Gemini Nano).</p>
+          <p class="subtitle">Classic Battleship with optional on-device AI commentary via Chrome's Prompt API (Gemini Nano).</p>
         </div>
         <div class="header-actions">
           <button type="button" id="mute-toggle" class="btn secondary"></button>
@@ -111,6 +166,10 @@ export function createApp(root: HTMLElement): void {
         <h2>Choose Opponent</h2>
         <div class="opponent-options" id="opponent-options"></div>
         <div id="ai-status" class="ai-status"></div>
+        <label class="commentary-toggle" id="commentary-toggle">
+          <input type="checkbox" id="commentary-checkbox" />
+          <span>🦆 Funny AI commentary <small>(Captain Quack narrates — kid-friendly)</small></span>
+        </label>
       </section>
 
       <section class="panel status-panel">
@@ -153,6 +212,12 @@ export function createApp(root: HTMLElement): void {
   const shipPaletteEl = root.querySelector('#ship-palette') as HTMLElement;
   const startBtn = root.querySelector('#start-btn') as HTMLButtonElement;
   const muteToggle = root.querySelector('#mute-toggle') as HTMLButtonElement;
+  const commentaryToggle = root.querySelector('#commentary-toggle') as HTMLElement;
+  const commentaryCheckbox = root.querySelector('#commentary-checkbox') as HTMLInputElement;
+
+  commentaryCheckbox.addEventListener('change', () => {
+    void setCommentary(commentaryCheckbox.checked);
+  });
 
   function announce(text: string): void {
     liveRegion.textContent = text;
@@ -163,22 +228,19 @@ export function createApp(root: HTMLElement): void {
       opponent: state.opponentType,
       muted: settings.muted,
       reducedMotion: settings.reducedMotion,
+      commentary: settings.commentary,
     };
   }
 
   function resetToSetup(opponentType?: OpponentType): void {
-    aiOpponent.endMatch();
+    commentator.reset();
+    commentaryReady = false;
     huntState = createHuntTargetState();
     transcript = [];
     opponentBusy = false;
     selectedShipSpec = null;
     placementPreview = null;
-    state = createInitialState(
-      resolveOpponent(
-        opponentType ?? settings.opponent,
-        availability.state === 'available',
-      ),
-    );
+    state = createInitialState(opponentType ?? settings.opponent);
     render();
   }
 
@@ -190,35 +252,11 @@ export function createApp(root: HTMLElement): void {
 
   async function refreshAvailability(): Promise<void> {
     availability = await checkAvailability();
-    if (settings.opponent === 'aiNano' && availability.state !== 'available') {
-      state = {
-        ...state,
-        opponentType: resolveOpponent('aiNano', false),
-      };
-    }
     render();
   }
 
-  async function selectOpponent(type: OpponentType): Promise<void> {
+  function selectOpponent(type: OpponentType): void {
     resumeAudio();
-    if (type === 'aiNano') {
-      if (availability.state === 'unavailable') return;
-      try {
-        if (availability.state === 'downloadable' || availability.state === 'downloading') {
-          aiStatusEl.textContent = 'Preparing on-device model...';
-          await ensureModelReady((progress) => {
-            availability = { ...availability, downloadProgress: progress, state: 'downloading' };
-            render();
-          });
-          availability = { ...availability, state: 'available', downloadProgress: 100 };
-        }
-      } catch (error) {
-        aiStatusEl.textContent =
-          error instanceof Error ? error.message : 'Failed to prepare AI model.';
-        return;
-      }
-    }
-
     settings.opponent = type;
     state = { ...state, opponentType: type };
     saveSettings(currentSettings());
@@ -227,7 +265,6 @@ export function createApp(root: HTMLElement): void {
 
   function renderOpponentOptions(): void {
     opponentOptionsEl.innerHTML = '';
-    aiStatusEl.replaceChildren();
     const options: Array<{ type: OpponentType; label: string; description: string }> = [
       {
         type: 'huntTarget',
@@ -239,11 +276,6 @@ export function createApp(root: HTMLElement): void {
         label: 'Probability Bot',
         description: 'Heatmap-based placement density targeting.',
       },
-      {
-        type: 'aiNano',
-        label: 'AI-Nano',
-        description: 'On-device Gemini Nano via Chrome Prompt API.',
-      },
     ];
 
     for (const option of options) {
@@ -254,47 +286,29 @@ export function createApp(root: HTMLElement): void {
       input.name = 'opponent';
       input.value = option.type;
       input.checked = state.opponentType === option.type;
-      const disabled =
-        option.type === 'aiNano' && availability.state !== 'available';
-      input.disabled = disabled;
 
       const text = document.createElement('div');
       text.innerHTML = `<strong>${option.label}</strong><span>${option.description}</span>`;
-      if (disabled) {
-        const reason = document.createElement('small');
-        reason.className = 'disabled-reason';
-        reason.textContent = availability.reason || 'AI unavailable on this browser.';
-        text.appendChild(reason);
-      }
 
       input.addEventListener('change', () => {
-        void selectOpponent(option.type);
+        selectOpponent(option.type);
       });
 
       label.appendChild(input);
       label.appendChild(text);
       opponentOptionsEl.appendChild(label);
     }
+  }
 
-    if (availability.state === 'downloadable') {
-      aiStatusEl.replaceChildren();
-      const enableBtn = document.createElement('button');
-      enableBtn.type = 'button';
-      enableBtn.className = 'btn secondary';
-      enableBtn.textContent = 'Enable On-Device AI';
-      enableBtn.addEventListener('click', () => {
-        void selectOpponent('aiNano');
-      });
-      aiStatusEl.appendChild(enableBtn);
-    } else if (availability.state === 'downloading') {
-      aiStatusEl.textContent = `Downloading model... ${availability.downloadProgress ?? 0}%`;
-    } else if (availability.state === 'available') {
-      aiStatusEl.textContent = 'On-device AI ready.';
-    } else if (availability.state === 'unavailable') {
-      aiStatusEl.textContent = availability.reason;
-    } else {
-      aiStatusEl.textContent = '';
-    }
+  function renderCommentaryToggle(): void {
+    const unavailable = availability.state !== 'available' &&
+      availability.state !== 'downloadable';
+    commentaryCheckbox.checked = settings.commentary;
+    commentaryCheckbox.disabled = unavailable;
+    commentaryToggle.classList.toggle('disabled', unavailable);
+    commentaryToggle.title = unavailable
+      ? availability.reason || 'On-device AI is unavailable in this browser.'
+      : '';
   }
 
   function renderPalette(): void {
@@ -332,7 +346,7 @@ export function createApp(root: HTMLElement): void {
           : 'You lose. Your fleet has been destroyed.';
       return;
     }
-    if (opponentBusy || aiThinking) {
+    if (opponentBusy) {
       statusTextEl.textContent = 'Opponent is thinking...';
       return;
     }
@@ -350,8 +364,7 @@ export function createApp(root: HTMLElement): void {
   }
 
   function renderTranscript(): void {
-    sidePanelTitle.textContent =
-      state.opponentType === 'aiNano' ? 'AI Transcript' : 'Move Log';
+    sidePanelTitle.textContent = settings.commentary ? 'Captain Quack' : 'Move Log';
     transcriptEl.innerHTML = '';
     if (transcript.length === 0) {
       transcriptEl.innerHTML = '<p class="empty-log">No moves yet.</p>';
@@ -431,8 +444,7 @@ export function createApp(root: HTMLElement): void {
     const enemyInteractive =
       state.phase === 'playing' &&
       state.turn === 'player' &&
-      !opponentBusy &&
-      !aiThinking;
+      !opponentBusy;
 
     enemyBoardWrap.replaceChildren(
       renderBoard({
@@ -527,6 +539,7 @@ export function createApp(root: HTMLElement): void {
     announce(
       `${coordToLabel(coord)}: ${outcome.result.kind}${outcome.continuesTurn ? '. Hit — fire again.' : '. Turn over.'}`,
     );
+    maybeComment('player', outcome.result, coordToLabel(coord));
 
     if (state.phase === 'finished') {
       if (state.winner === 'player') playWin();
@@ -555,22 +568,21 @@ export function createApp(root: HTMLElement): void {
       state = outcome.state;
       playResultSound(outcome.result);
 
-      if (state.opponentType !== 'aiNano') {
-        transcript = [
-          ...transcript,
-          {
-            id: crypto.randomUUID(),
-            kind: 'bot-move',
-            text: `${coordToLabel(coord)} → ${outcome.result.kind}`,
-            timestamp: Date.now(),
-          },
-        ];
-      }
+      transcript = [
+        ...transcript,
+        {
+          id: crypto.randomUUID(),
+          kind: 'bot-move',
+          text: `${coordToLabel(coord)} → ${outcome.result.kind}`,
+          timestamp: Date.now(),
+        },
+      ];
 
       animateCell('player', coord, `anim-${outcome.result.kind}`, settings.reducedMotion);
       announce(
         `Opponent fired ${coordToLabel(coord)}: ${outcome.result.kind}`,
       );
+      maybeComment('opponent', outcome.result, coordToLabel(coord));
 
       if (state.opponentType === 'huntTarget') {
         huntState = huntTargetAfterShot(huntState, {
@@ -586,31 +598,20 @@ export function createApp(root: HTMLElement): void {
 
       if (!outcome.continuesTurn) break;
       render();
-      await delay(state.opponentType === 'aiNano' ? 300 : 500);
+      await delay(500);
     }
 
     opponentBusy = false;
     render();
   }
 
-  async function chooseOpponentMove(): Promise<Coordinate> {
+  function chooseOpponentMove(): Coordinate {
     const board = state.opponentView;
     const history = state.opponentShotHistory;
     const sizes = remainingShipSizes(state.playerShips);
-    const last = history[history.length - 1] ?? null;
 
     if (state.opponentType === 'probability') {
       return probabilityChooseMove(board, history, sizes);
-    }
-
-    if (state.opponentType === 'aiNano') {
-      const move = await aiOpponent.chooseMove(
-        board,
-        state.playerShips,
-        history,
-        last,
-      );
-      return { row: move.row, col: move.col };
     }
 
     const result = huntTargetChooseMove(board, history, sizes, huntState);
@@ -624,6 +625,7 @@ export function createApp(root: HTMLElement): void {
 
   function render(): void {
     renderOpponentOptions();
+    renderCommentaryToggle();
     renderPalette();
     renderStatus(state);
     renderStats(state);
@@ -667,10 +669,7 @@ export function createApp(root: HTMLElement): void {
         : 'Battle started. Opponent fires first.',
     );
     render();
-    if (state.opponentType === 'aiNano') {
-      await aiOpponent.prepare();
-      await aiOpponent.startMatch(state.playerShips);
-    }
+    await startCommentator();
     if (state.turn === 'opponent') {
       await runOpponentTurn();
     }

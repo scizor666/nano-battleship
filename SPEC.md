@@ -1,6 +1,6 @@
 # Nano Battleship - Specification
 
-> Status: Implemented v1.0 (matches shipped code)
+> Status: Implemented v1.1 (matches shipped code)
 > Scope: This document is the authoritative, normative specification for the Nano
 > Battleship web game. It describes **what** must be built, not the
 > implementation code. Where it uses RFC 2119 keywords (MUST, MUST NOT, SHOULD,
@@ -11,20 +11,35 @@
 ## 1. Overview & Goals
 
 Nano Battleship is an in-browser, single-player implementation of the classic
-Battleship game. The player places a fleet and battles a single computer
-opponent of their choosing.
+Battleship game. The player places a fleet and battles a single **algorithmic**
+opponent of their choosing, optionally accompanied by an on-device AI
+**commentator**.
 
-The headline ("killer") feature is an **on-device AI opponent** powered by
-Chrome's built-in Prompt API (Gemini Nano). All AI inference runs locally in the
-browser; there is no server and no cloud AI.
+All AI inference runs locally in the browser via Chrome's built-in Prompt API
+(Gemini Nano); there is no server and no cloud AI.
 
 Goals:
 
 - Deliver a polished, accessible, classic Battleship experience.
-- Make the AI-Nano opponent the centerpiece: a genuinely on-device LLM that
-  plays fairly under fog-of-war and exposes its reasoning to the player.
-- Degrade gracefully: when the Prompt API is unavailable, the AI option is
-  hidden/disabled and two conventional bots remain fully playable.
+- Provide two strong, fully-offline algorithmic bots as the actual opponents.
+- Offer an **optional, kid-friendly on-device AI commentator** that narrates the
+  match with light humor, layered on top of whichever bot is selected.
+- Degrade gracefully: when the Prompt API is unavailable, the commentary toggle is
+  disabled and both bots remain fully playable.
+
+### 1.1 Design rationale — why AI does NOT pick moves
+
+Choosing Battleship shots well is a **spatial-combinatorial** task: track a 10×10
+grid across turns, enumerate legal remaining-ship placements, and count which cell
+maximizes hit probability. LLMs reason over text, not coordinate grids, and are
+unreliable at exactly this; small on-device models most of all. Meanwhile a tiny
+deterministic algorithm (the Probability Bot, [Section 5.2](#52-probability-density-bot))
+solves it near-optimally and instantly.
+
+Therefore the move decision MUST be made by an algorithmic bot. The on-device
+model MUST be used **only** for player-facing commentary
+([Section 6](#6-ai-commentary-captain-quack)) and MUST NOT influence move
+selection, board state, or game outcome.
 
 Non-goals are listed in [Section 12](#12-non-goals).
 
@@ -34,8 +49,8 @@ Non-goals are listed in [Section 12](#12-non-goals).
 
 - **Language/build:** Vanilla TypeScript compiled/bundled with **Vite**. No UI
   framework (no React/Vue/Svelte). DOM is manipulated directly.
-- **Runtime:** Modern evergreen browsers for the base game. The AI-Nano opponent
-  additionally requires the Prompt API (see constraints below).
+- **Runtime:** Modern evergreen browsers for the full game. The AI commentary
+  feature additionally requires the Prompt API (see constraints below).
 - **Persistence:** `localStorage` for **settings only** (see
   [Section 11](#11-persistence)). In-progress matches are **not** persisted and
   reset on reload.
@@ -51,16 +66,16 @@ Non-goals are listed in [Section 12](#12-non-goals).
 - Distro-packaged Chromium, Brave, Edge, and CEF/embedded builds typically lack
   the on-device model component; `LanguageModel.availability()` will report
   `unavailable`/`downloading` regardless of hardware. The app MUST treat these as
-  "AI unavailable" and fall back to conventional bots.
+  "AI unavailable" and disable the commentary toggle.
 - **Hardware (enforced by Chrome, surfaced via `availability()`):**
   - ~22 GB free disk space on the volume containing the Chrome profile (model
     is removed if free space drops below ~10 GB after download).
   - GPU with **>4 GB VRAM**, **or** CPU path with **≥16 GB RAM** and **≥4 CPU
     cores**.
   - Unmetered network connection for the **initial model download only**; play
-    is offline afterward. No prompt data is sent to Google.
+    and commentary are offline afterward. No prompt data is sent to Google.
 - The model is downloaded on first use per origin (multi-GB), gated behind a
-  user gesture (`create()` after meaningful interaction).
+  user gesture (enabling commentary).
 
 ### 2.2 Enabling the Prompt API when it is behind flags
 
@@ -96,7 +111,7 @@ The app MUST be fully static. It is deployed to **GitHub Pages** at
 - **Placement legality:** Ships are axis-aligned (horizontal or vertical). Ships
   MUST NOT overlap and MUST NOT touch each other, including diagonally (every
   ship must be surrounded by at least one empty cell or a board edge on all
-  sides). This applies to both the human fleet and every bot's fleet.
+  sides). This applies to both the human fleet and the bot's fleet.
 - **Turn flow (extra shot on hit):** On a player's turn they fire at one enemy
   cell.
   - A **hit** grants the same player **another shot** immediately. The player
@@ -117,32 +132,30 @@ The app MUST be fully static. It is deployed to **GitHub Pages** at
 
 ## 4. Opponent Selection
 
-Before a match the player chooses exactly one opponent from a menu:
+Before a match the player chooses exactly one opponent from a menu. Both options
+are **algorithmic** and **always available** (no network, no Prompt API):
 
-1. **Hunt/Target bot** (conventional) - always available.
-2. **Probability-density bot** (conventional) - always available.
-3. **AI-Nano** (on-device LLM) - available **only** when the Prompt API is
-   usable on the current browser/device.
+1. **Hunt/Target bot** ([5.1](#51-hunttarget-bot)).
+2. **Probability-density bot** ([5.2](#52-probability-density-bot)).
+
+The optional AI commentator ([Section 6](#6-ai-commentary-captain-quack)) is a
+**separate toggle**, not an opponent. It is orthogonal to the opponent choice and
+can be enabled with either bot.
 
 Requirements:
 
-- When the Prompt API is unavailable, the AI-Nano entry MUST be visibly
-  **disabled** (not removed) with a short, clear explanation of why (e.g.
-  "Requires Google Chrome 148+ on desktop") and, where applicable, a link/short
-  note about enabling it.
-- The opponent picker MUST reflect availability state changes (e.g. after a
-  model download completes, the AI option becomes enabled).
 - The last chosen opponent SHOULD be remembered across reloads (see
-  [Section 11](#11-persistence)), but MUST silently fall back to a conventional
-  bot if the remembered choice was AI-Nano and AI is no longer available.
+  [Section 11](#11-persistence)).
+- A persisted opponent value that is no longer valid (e.g. the retired `aiNano`
+  player from a prior version) MUST be migrated to a valid bot on load.
 
 ---
 
-## 5. Conventional Bots
+## 5. Algorithmic Bots
 
-Both conventional bots play under the same fog-of-war as the player (they only
-know the results of their own shots: miss, hit, sunk). Neither bot may read the
-human's ship layout.
+Both bots play under the same fog-of-war as the player (they only know the results
+of their own shots: miss, hit, sunk). Neither bot may read the human's ship
+layout. The selected bot is the **sole** decider of every opponent shot.
 
 ### 5.1 Hunt/Target bot
 
@@ -158,172 +171,94 @@ human's ship layout.
 
 ### 5.2 Probability-density bot
 
-- Each turn, compute a **per-cell probability heatmap**: for every
-  not-yet-sunk ship still in the enemy fleet, enumerate all legal placements
-  consistent with the known board state (misses block placement; unhit cells are
-  candidates), and increment each covered cell's score.
-- Weight/boost cells adjacent to existing unresolved **hits** so the bot
-  prioritizes finishing damaged ships.
+- Each turn, compute a **per-cell probability heatmap**: for every not-yet-sunk
+  ship still in the enemy fleet, enumerate all legal placements consistent with
+  the known board state and increment each covered cell's score.
+- **Blocked cells:** a placement MUST NOT overlap a known **miss** or a cell
+  occupied by an **already-sunk** ship.
+- **Sunk-ship reconstruction:** because ships never touch (not even diagonally),
+  a sunk ship's hull is exactly the contiguous run of damaged cells through the
+  sinking shot. The bot MUST reconstruct that hull so that (a) those cells are
+  treated as blocked, and (b) the sunk ship's earlier hits are **not** treated as
+  still-wounded ships. This prevents wasting shots around an already-destroyed
+  ship.
+- **Unresolved hits:** hits not attributed to any sunk ship are the wounded ships
+  to finish. The bot MUST boost cells orthogonally adjacent to unresolved hits so
+  it prioritizes finishing damaged ships.
 - Fire at the **highest-scoring legal (un-fired) cell**, breaking ties randomly.
-
-### 5.3 Shared fallback role
-
-The Hunt/Target algorithm (5.1) is also used as the **AI-Nano fallback move
-generator** (see [Section 6.6](#66-resilience--fallback)).
 
 ---
 
-## 6. AI-Nano Opponent (core specification)
+## 6. AI Commentary ("Captain Quack")
 
-The AI-Nano opponent uses an on-device Gemini Nano session via the Prompt API
-to choose each shot. To keep small models reliable, the app uses a **hybrid
-tactical loop**: the application computes legal candidate cells from fog-of-war
-state (Hunt/Target logic), constrains the model to pick one of them, and still
-displays the model's `reasoning` to the player.
+An **optional** on-device Gemini Nano session provides short, humorous,
+kid-friendly narration of the match. It is purely cosmetic: it MUST NOT affect
+move selection, board state, turn flow, or outcome
+([Section 1.1](#11-design-rationale--why-ai-does-not-pick-moves)).
 
-### 6.1 Fairness (fog-of-war)
+### 6.1 Activation
 
-- The model MUST operate under strict fog-of-war. It MUST only ever receive
-  information derivable from **its own shots** against the player's board:
-  - the grid dimensions and coordinate system (columns A–J, rows 1–10),
-  - an ASCII **fog grid** built from shot history (`.`=unknown, `O`=miss,
-    `X`=hit, `#`=sunk),
-  - for each cell it has fired on: the result (`miss`, `hit`, or `sunk` + which
-    ship sank),
-  - the list of enemy ship sizes still afloat,
-  - the current tactical **mode** (`HUNT` or `TARGET`),
-  - a **candidate list** of legal, not-yet-fired cells (see [6.1.1](#611-candidate-generation)),
-  - optionally the **last shot result** and retry hints on validation failure.
-- The model MUST NOT be given the player's ship positions, nor any cell state it
-  has not earned through its own fire.
+- Commentary is controlled by a single **toggle** in the setup UI, persisted in
+  settings ([Section 11](#11-persistence)).
+- The toggle MUST be **disabled** when the Prompt API is unavailable, with a
+  concise reason surfaced to the user (e.g. via tooltip).
+- Enabling commentary for the first time MAY trigger the model download
+  ([Section 7](#7-prompt-api-availability--model-download-ux)); this MUST be
+  gated behind the user's toggle gesture.
+- Commentary works with **either** bot and in no way changes how the bot plays.
 
-#### 6.1.1 Candidate generation
+### 6.2 Persona & content safety (normative)
 
-Each turn, before prompting the model, the app:
+- The model is given a fixed persona: a silly, friendly cartoon character
+  ("Captain Quack") narrating for young children.
+- The system prompt MUST constrain output to:
+  - **one short sentence** (≈16 words or fewer),
+  - playful, gentle humor appropriate for ~7-year-olds,
+  - **no** profanity, insults, name-calling, scary content, violence, blood, or
+    real-world weapons; cartoony imagery only (splashes, bubbles, fish, ducks),
+  - never demeaning the player.
+- **Defense in depth:** the app MUST NOT trust the model's output blindly. Every
+  generated line MUST pass an independent **sanitizer** before display, which:
+  - keeps only the first line and strips wrapping quotes/markers,
+  - caps length (characters and word count),
+  - rejects any line matching a **profanity/unsafe word list** using
+    word-boundary matching (so safe words containing a banned substring — e.g.
+    "class", "assist" — are not falsely rejected).
+- If the sanitizer rejects a line (or the model errors or is slow), the app MUST
+  substitute a **safe canned quip** appropriate to the event so the player still
+  sees friendly output. The game never shows unscreened model text.
 
-1. Derives Hunt/Target state from the AI's shot history.
-2. Computes a **primary** recommended cell via the Hunt/Target bot ([5.1](#51-hunttarget-bot)).
-3. Builds a **candidate pool** (deduplicated, capped at 16 cells):
-   - always includes the primary cell;
-   - in **TARGET** mode (unresolved hits): orthogonal neighbors and in-line
-     extensions from known hits;
-   - in **HUNT** mode: parity-spaced cells plus a small random sample of
-     untouched cells.
-4. Passes candidate labels (e.g. `C4`) to the model; already-fired cells are
-   listed separately as **FORBIDDEN**.
+### 6.3 Triggering & non-blocking behavior
 
-The model chooses **which candidate** to fire on and explains why; it does not
-pick arbitrary off-list coordinates.
+- A quip MAY be generated after each resolved shot (the player's and the
+  opponent's), keyed off the result (`miss` / `hit` / `sunk`).
+- Commentary MUST be **fire-and-forget**: generating a quip MUST NOT block, delay,
+  or gate gameplay. Moves resolve at full speed regardless of model latency.
+- The app SHOULD avoid overlapping requests on the single commentary session
+  (e.g. skip a new quip while one is still generating).
+- Quips appear in the side panel ([Section 9](#9-ui-layout)) attributed to the
+  commentator.
 
-### 6.2 Output contract (strict JSON)
+### 6.4 Session model
 
-- The model MUST respond with **strict JSON only** (no prose outside the JSON).
-- **Primary shape** (enforced via `responseConstraint` JSON Schema):
+- **Model download:** a warmup `LanguageModel.create()` call (with
+  `downloadprogress` monitoring) may run once after the user enables commentary to
+  trigger the on-device model download. That warmup session is destroyed
+  immediately.
+- **Commentary session:** the app creates a dedicated `LanguageModel` session for
+  commentary, seeded with the persona system prompt. It is created when commentary
+  becomes active (toggle on / match start) and destroyed on reset/new match or
+  when commentary is turned off. It carries **no** board state and is independent
+  of the bot.
+- Fairness note: because commentary is cosmetic and reacts to already-resolved,
+  player-visible results, it is **not** bound by the move-time fog-of-war rules.
 
-```json
-{ "target": "C4", "reasoning": "short explanation of the chosen target" }
-```
+### 6.5 Debug logging
 
-- `target` MUST be a coordinate label (`A1`–`J10`) copied **exactly** from the
-  candidate list. `reasoning` is a short human-readable string.
-- The parser MAY also accept legacy `{ "row": 0, "col": 0, "reasoning": "..." }`
-  with 0-indexed integers for robustness, but the constrained `target` form is
-  normative.
-- **Validation:** A response is **valid** only if it parses as JSON, includes
-  `reasoning`, resolves to a legal coordinate, the coordinate is in the current
-  candidate set, and the cell has **not already been fired upon**. Anything else
-  is **invalid**.
-
-### 6.3 Session model
-
-- **Model download:** A separate warmup `LanguageModel.create()` call (with
-  `downloadprogress` monitoring) may run once after a user gesture to trigger
-  the on-device model download. That warmup session is destroyed immediately;
-  it is not used for gameplay.
-- **Match session:** The app MUST create **one persistent `LanguageModel`
-  session per match**, with:
-  - a system prompt (rules, coordinates, output contract, remaining ship sizes,
-    Hunt/Target strategy hints),
-  - optional `initialPrompts` replaying full shot history when restarting a
-    session ([6.6](#66-resilience--fallback)).
-- On **each AI shot**, the app sends a **full turn prompt** containing the fog
-  grid, forbidden cells, candidate list, recommended cell, tactical mode, and
-  the latest shot result (if any). Retry prompts append validation feedback.
-- The first shot uses the same turn-prompt shape; there is no separate
-  "opening move" prose-only prompt.
-
-### 6.4 Reasoning transcript
-
-- The `reasoning` field from each accepted move MUST be displayed live in a
-  side **transcript/log panel**, attributed to the AI, alongside the coordinate
-  it fired on.
-- The transcript SHOULD also surface notable system events (retry, fresh
-  session, fallback) in a user-friendly form (full detail goes to debug logs,
-  see [6.7](#67-debug-logging)).
-
-### 6.5 Turn loop with extra-shot rule
-
-Because a hit grants another shot, the AI may take multiple consecutive shots in
-one turn. Each individual shot runs through the request/validate/resilience loop
-below. After a shot resolves:
-
-- if it was a **hit/sunk** (and the player still has ships), the AI immediately
-  takes another shot;
-- if it was a **miss**, the AI's turn ends.
-
-### 6.6 Resilience & fallback
-
-The following logic governs a **single AI shot** and MUST emit debug logs at
-every branch (see [6.7](#67-debug-logging)):
-
-- Maintain an `attempts` counter (per shot) and a `consecutiveInvalid` counter.
-- Request a move from the session; validate per [6.2](#62-output-contract-strict-json).
-  - **Valid:** fire the shot, reset `consecutiveInvalid`, render reasoning, done.
-  - **Invalid:** increment `attempts` and `consecutiveInvalid`; log the raw
-    response and the reason it was rejected; then:
-    - If `consecutiveInvalid >= 2`: **discard the session and start a fresh
-      one**, re-seeded with the system prompt **and the full board shot history**
-      (all of the AI's prior shots and their results). Reset `consecutiveInvalid`
-      to 0 and log the restart.
-    - If `attempts < MAX_ATTEMPTS_PER_MOVE`: re-prompt (loop).
-    - Else (`attempts` reached the cap): **fall back** to the **Hunt/Target**
-      algorithm ([5.1](#51-hunttarget-bot)) to choose a legal move for this
-      shot, log the fallback, and fire that move. The persistent session is kept
-      for subsequent shots (a single bad shot does not end AI play).
-- If the session throws `InvalidStateError` (destroyed), recreate the match
-  session with full history and retry the same prompt once.
-
-Thresholds (confirmed defaults; treated as named constants in the spec):
-
-- `FRESH_SESSION_AFTER_CONSECUTIVE_INVALID = 2`
-- `MAX_ATTEMPTS_PER_MOVE = 5`
-
-```mermaid
-flowchart TD
-  startTurn[AI shot begins] --> ask[Request move from session]
-  ask --> parse{Valid JSON and legal candidate?}
-  parse -->|yes| fire[Fire shot, show reasoning, reset consecutiveInvalid]
-  parse -->|no| log[Debug-log invalid response]
-  log --> consec{consecutiveInvalid >= 2?}
-  consec -->|yes| fresh[Discard session; fresh session with full history; log]
-  consec -->|no| more{attempts < 5?}
-  fresh --> more
-  more -->|yes| ask
-  more -->|no| fb[Hunt/Target fallback move; log]
-  fb --> fire
-```
-
-### 6.7 Debug logging
-
-- A dedicated debug logger MUST record, at minimum: each prompt sent (or a
-  redactable summary), each raw model response, every validation failure with its
-  reason, every fresh-session restart (with the reason and history size), and
-  every fallback (with the chosen fallback cell).
-- Debug logs are **developer-facing only** (browser `console`; no in-app debug
-  panel) and are separate from the player-facing transcript
-  ([6.4](#64-reasoning-transcript)).
-- Logs MUST NOT block gameplay and SHOULD be throttle-safe (ring buffer capped,
-  e.g. 200 entries).
+- A developer-facing debug logger SHOULD record raw quips and filter decisions
+  (e.g. which banned word triggered a rejection) to the browser `console` only.
+- Debug logs MUST NOT block gameplay and MUST be separate from the player-facing
+  commentary panel.
 
 ---
 
@@ -331,49 +266,47 @@ flowchart TD
 
 ### 7.1 Detection
 
-- On load (and when the player opens the opponent picker), the app MUST detect
-  Prompt API support by checking for `LanguageModel` in scope and calling
-  `LanguageModel.availability()`.
+- On load, the app MUST detect Prompt API support by checking for `LanguageModel`
+  in scope and calling `LanguageModel.availability()`.
 - The app MUST handle all four states:
   - `available` - ready to use immediately.
   - `downloadable` - supported but the model must be downloaded first.
   - `downloading` - a download is in progress.
   - `unavailable` - not supported on this browser/device.
 - `availability()` SHOULD be called with options consistent with later
-  `create()`/`prompt()` calls. The implementation uses a minimal probe
-  (`LanguageModel.availability({ systemPrompt: '' })`) on load; full
-  `systemPrompt`, `initialPrompts`, and per-turn `responseConstraint` are applied
-  at session creation and prompt time.
+  `create()` calls. The implementation uses a minimal probe
+  (`LanguageModel.availability({ systemPrompt: '' })`) on load.
 
 ### 7.2 Download flow
 
-- Model download MUST be triggered by a **user gesture** (e.g. selecting AI-Nano
-  or pressing an explicit "Enable on-device AI" button).
+- Model download MUST be triggered by a **user gesture** — enabling the **Funny
+  AI commentary** toggle.
 - During download the app MUST subscribe to the `downloadprogress` events on the
   creation monitor and show a **progress indicator** with percentage so the UI
   never appears frozen.
-- On completion, the AI-Nano option becomes enabled/selectable.
-- Download/initialization errors MUST be surfaced clearly and MUST leave the
-  conventional bots fully usable.
+- On completion, commentary becomes active.
+- Download/initialization errors MUST be surfaced clearly, MUST revert the toggle
+  to off, and MUST leave the bots fully playable.
 
 ### 7.3 Disabled-state messaging
 
-- When state is `unavailable`, the AI-Nano option MUST be disabled with a concise
-  reason (platform/browser requirement) per [Section 4](#4-opponent-selection).
+- When state is `unavailable`, the commentary toggle MUST be disabled with a
+  concise reason (platform/browser requirement).
 
 ```mermaid
 flowchart TD
-  load[App start / open picker] --> has{LanguageModel in scope?}
-  has -->|no| disabled[Disable AI option with reason]
-  has -->|yes| avail[Call availability with same options]
+  load[App start] --> has{LanguageModel in scope?}
+  has -->|no| disabled[Disable commentary toggle with reason]
+  has -->|yes| avail[Call availability]
   avail --> st{State}
-  st -->|available| enabled[Enable AI option]
-  st -->|downloadable| gesture[Show Enable AI button]
+  st -->|available| enabled[Enable commentary toggle]
+  st -->|downloadable| enabled
   st -->|downloading| progress[Show download progress]
   st -->|unavailable| disabled
-  gesture --> dl[User gesture triggers create with monitor]
+  enabled --> gesture[User enables commentary]
+  gesture --> dl[Gesture triggers create with monitor if needed]
   dl --> progress
-  progress --> done[On complete: enable AI option]
+  progress --> done[On complete: commentary active]
 ```
 
 ---
@@ -400,10 +333,11 @@ The screen MUST present:
 
 - **Two boards:** the player's board (ships visible) and the enemy board shown as
   **fog** (only the player's own shot results revealed).
-- **Opponent picker** with availability states ([Section 4](#4-opponent-selection)).
-- **Transcript/log panel:** for AI-Nano, shows reasoning and system events
-  ([Section 6.4](#64-reasoning-transcript)); for conventional bots, shows a
-  simple **Move Log** (coordinate + result per shot).
+- **Opponent picker** with the two bots ([Section 4](#4-opponent-selection)).
+- **Funny AI commentary toggle** ([Section 6](#6-ai-commentary-captain-quack)),
+  disabled with a reason when the Prompt API is unavailable.
+- **Side panel:** a **Move Log** of shots (coordinate + result); when commentary
+  is enabled it additionally shows the commentator's quips.
 - **Status / turn indicator:** whose turn it is, last result, and end-of-match
   result.
 - **Controls:** placement controls (rotate/randomize/clear/start), new-match /
@@ -419,8 +353,8 @@ The screen MUST present:
   fire) and ARIA/screen-reader support (cells announce coordinate and state;
   turn and result changes announced via live regions). Visible focus states.
 - **Responsive layout:** Mobile-friendly, reflowing layout for small screens.
-  The UI MUST clearly note that the AI-Nano opponent is **desktop Chrome only**;
-  conventional bots remain available on mobile.
+  The UI MUST clearly note that AI commentary is **desktop Chrome only**; the bots
+  remain available on mobile.
 - **Sound effects:** Fire, hit, miss, sink, win/lose cues with a **mute toggle**
   (state persisted, see [Section 11](#11-persistence)).
 - **Animations:** Hit, miss, and sink animations on the boards. Animations MUST
@@ -435,23 +369,25 @@ The screen MUST present:
 
 - Persist **settings only** in `localStorage`:
   - last selected opponent type,
-  - mute/sound preference.
+  - mute/sound preference,
+  - AI commentary on/off preference.
+- A persisted opponent value that is not a currently-valid bot MUST be migrated to
+  the default bot on load.
 - Reduced motion follows the system `prefers-reduced-motion` media query at
   startup (not persisted as a user-facing setting).
 - In-progress match state MUST NOT be persisted; reloading starts a fresh setup.
-- A remembered AI-Nano opponent choice MUST fall back to a conventional bot if
-  AI is unavailable on load.
 
 ---
 
 ## 12. Non-Goals
 
 - No multiplayer or networking (no online play, no pass-and-play).
+- **No AI-driven move selection.** The on-device model is used only for cosmetic
+  commentary ([Section 1.1](#11-design-rationale--why-ai-does-not-pick-moves)).
 - No server-side or cloud AI; all AI is on-device via the Prompt API.
 - No resume-after-reload of an in-progress match.
 - No accounts, profiles, or persistent leaderboards.
-- No selectable difficulty beyond the three opponent types in
-  [Section 4](#4-opponent-selection).
+- No selectable difficulty beyond the two opponent bots.
 
 ---
 
@@ -471,27 +407,28 @@ concrete code):
   only) and shot state (untouched | miss | hit).
 - **ShotResult:** `miss` | `hit` | `sunk(shipSize/ship)`.
 - **GamePhase:** `setup` | `playing` | `finished`, plus whose turn it is.
-- **OpponentType:** `huntTarget` | `probability` | `aiNano`.
-- **AI session state:** handle to the persistent `LanguageModel` session, plus
-  per-shot `attempts` and `consecutiveInvalid` counters, tactical candidate
-  context, and the AI's own shot history (for fresh-session re-seeding).
-- **TacticalContext:** mode (`hunt`|`target`), candidate coordinates, primary
-  recommendation, forbidden labels, fog grid string.
+- **OpponentType:** `huntTarget` | `probability`.
+- **Commentary state:** handle to the optional `LanguageModel` commentary session,
+  a busy flag (to avoid overlapping requests), and the safe canned-quip pools.
+- **TranscriptEntry:** kind (`bot-move` | `ai-banter` | `system`), text, id,
+  timestamp.
 - **Availability state:** `available` | `downloadable` | `downloading` |
   `unavailable`, plus download progress.
 - **Stats:** per side - shots, hits, accuracy, turns.
-- **Settings:** last opponent, mute, UI preferences (persisted).
+- **Settings:** last opponent, mute, commentary on/off (persisted).
 
 ---
 
 ## 14. Open Risks
 
-- **Nano output instability:** Small on-device models can emit malformed or
-  illegal moves. Mitigated by the strict JSON contract, validation, retry,
-  fresh-session restart, and Hunt/Target fallback ([Section 6](#6-ai-nano-opponent-core-specification)).
 - **First-run model download:** Potentially multi-GB and slow; mitigated by clear
-  progress UX and keeping conventional bots fully playable meanwhile.
-- **Platform fragmentation:** Only official Chrome desktop supports the API;
-  conventional bots ensure the game is always playable.
-- **Latency:** On-device inference adds per-move latency; the UI MUST show a
-  thinking indicator and remain responsive.
+  progress UX, keeping the bots fully playable meanwhile, and commentary being
+  optional.
+- **Platform fragmentation:** Only official Chrome desktop supports the Prompt
+  API; the bots ensure the game is always fully playable without it.
+- **Commentary safety:** Small on-device models can emit inappropriate text.
+  Mitigated by a constrained persona prompt **and** an independent sanitizer /
+  profanity filter with safe canned fallbacks ([Section 6.2](#62-persona--content-safety-normative)).
+- **Commentary latency:** On-device inference is slow; mitigated by fire-and-forget
+  generation that never blocks gameplay.
+```
