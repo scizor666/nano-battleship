@@ -1,6 +1,6 @@
 # Nano Battleship - Specification
 
-> Status: Draft v1.0
+> Status: Implemented v1.0 (matches shipped code)
 > Scope: This document is the authoritative, normative specification for the Nano
 > Battleship web game. It describes **what** must be built, not the
 > implementation code. Where it uses RFC 2119 keywords (MUST, MUST NOT, SHOULD,
@@ -44,15 +44,47 @@ Non-goals are listed in [Section 12](#12-non-goals).
 ### 2.1 AI platform constraints (must be documented in-app)
 
 - The Prompt API / Gemini Nano is available only in **official Google Chrome
-  desktop builds (version 148+)** on Windows, macOS, Linux, and Chromebook Plus.
+  desktop builds (version 148+)** on Windows 10/11, macOS 13+, Linux, and
+  Chromebook Plus (ChromeOS platform 16389.0.0+).
 - It is **not** available on Chrome for Android/iOS, nor on ChromeOS on
   non-Chromebook-Plus devices.
-- Distro-packaged Chromium and CEF/embedded builds typically lack the
-  on-device model component; `LanguageModel.availability()` will report
+- Distro-packaged Chromium, Brave, Edge, and CEF/embedded builds typically lack
+  the on-device model component; `LanguageModel.availability()` will report
   `unavailable`/`downloading` regardless of hardware. The app MUST treat these as
   "AI unavailable" and fall back to conventional bots.
-- The model is downloaded on first use per browser (large download, multiple GB),
-  gated behind a user gesture.
+- **Hardware (enforced by Chrome, surfaced via `availability()`):**
+  - ~22 GB free disk space on the volume containing the Chrome profile (model
+    is removed if free space drops below ~10 GB after download).
+  - GPU with **>4 GB VRAM**, **or** CPU path with **≥16 GB RAM** and **≥4 CPU
+    cores**.
+  - Unmetered network connection for the **initial model download only**; play
+    is offline afterward. No prompt data is sent to Google.
+- The model is downloaded on first use per origin (multi-GB), gated behind a
+  user gesture (`create()` after meaningful interaction).
+
+### 2.2 Enabling the Prompt API when it is behind flags
+
+On **localhost**, in **older Chrome builds**, or when `LanguageModel` is missing
+from the global scope, users may need to enable Chrome flags and relaunch:
+
+1. [`chrome://flags/#prompt-api-for-gemini-nano`](chrome://flags/#prompt-api-for-gemini-nano)
+   — set to **Enabled** (or **Enabled multilingual**).
+2. [`chrome://flags/#optimization-guide-on-device-model`](chrome://flags/#optimization-guide-on-device-model)
+   — set to **Enabled**; use **Enabled BypassPerfRequirement** if hardware checks
+   fail on a capable machine.
+
+After relaunch, confirm in DevTools: `await LanguageModel.availability()` should
+not return `"unavailable"`. Troubleshoot at
+[`chrome://on-device-internals`](chrome://on-device-internals) (Model Status tab).
+
+Chrome **148+ stable desktop** on supported hardware generally exposes the Prompt
+API without flags. Flags remain the fallback for local development and pre-ship
+builds.
+
+### 2.3 Static hosting
+
+The app MUST be fully static. It is deployed to **GitHub Pages** at
+`/nano-battleship/` (Vite `base` path in production).
 
 ---
 
@@ -77,6 +109,9 @@ Non-goals are listed in [Section 12](#12-non-goals).
   player).
 - **Win condition:** A side wins when **all 5 enemy ships are sunk**. The match
   ends immediately.
+- **First turn:** Chosen **at random** (50/50) when the match starts.
+- **Bot fleet:** The opponent's fleet is **auto-randomized** at match start and
+  remains hidden until the match ends.
 
 ---
 
@@ -140,49 +175,82 @@ generator** (see [Section 6.6](#66-resilience--fallback)).
 
 ## 6. AI-Nano Opponent (core specification)
 
-The AI-Nano opponent uses a single on-device Gemini Nano session, via the Prompt
-API, to choose each shot. This section is normative and central to the product.
+The AI-Nano opponent uses an on-device Gemini Nano session via the Prompt API
+to choose each shot. To keep small models reliable, the app uses a **hybrid
+tactical loop**: the application computes legal candidate cells from fog-of-war
+state (Hunt/Target logic), constrains the model to pick one of them, and still
+displays the model's `reasoning` to the player.
 
 ### 6.1 Fairness (fog-of-war)
 
 - The model MUST operate under strict fog-of-war. It MUST only ever receive
   information derivable from **its own shots** against the player's board:
-  - the grid dimensions and coordinate system,
+  - the grid dimensions and coordinate system (columns A–J, rows 1–10),
+  - an ASCII **fog grid** built from shot history (`.`=unknown, `O`=miss,
+    `X`=hit, `#`=sunk),
   - for each cell it has fired on: the result (`miss`, `hit`, or `sunk` + which
     ship sank),
-  - the list of enemy ship sizes still afloat.
+  - the list of enemy ship sizes still afloat,
+  - the current tactical **mode** (`HUNT` or `TARGET`),
+  - a **candidate list** of legal, not-yet-fired cells (see [6.1.1](#611-candidate-generation)),
+  - optionally the **last shot result** and retry hints on validation failure.
 - The model MUST NOT be given the player's ship positions, nor any cell state it
-  has not earned through its own fire. The application is responsible for
-  constructing prompts that contain only this permitted information.
+  has not earned through its own fire.
+
+#### 6.1.1 Candidate generation
+
+Each turn, before prompting the model, the app:
+
+1. Derives Hunt/Target state from the AI's shot history.
+2. Computes a **primary** recommended cell via the Hunt/Target bot ([5.1](#51-hunttarget-bot)).
+3. Builds a **candidate pool** (deduplicated, capped at 16 cells):
+   - always includes the primary cell;
+   - in **TARGET** mode (unresolved hits): orthogonal neighbors and in-line
+     extensions from known hits;
+   - in **HUNT** mode: parity-spaced cells plus a small random sample of
+     untouched cells.
+4. Passes candidate labels (e.g. `C4`) to the model; already-fired cells are
+   listed separately as **FORBIDDEN**.
+
+The model chooses **which candidate** to fire on and explains why; it does not
+pick arbitrary off-list coordinates.
 
 ### 6.2 Output contract (strict JSON)
 
-- The model MUST be instructed (via system prompt) to respond with **strict
-  JSON only**, no prose outside the JSON, of the shape:
+- The model MUST respond with **strict JSON only** (no prose outside the JSON).
+- **Primary shape** (enforced via `responseConstraint` JSON Schema):
 
 ```json
-{ "row": 0, "col": 0, "reasoning": "short explanation of the chosen target" }
+{ "target": "C4", "reasoning": "short explanation of the chosen target" }
 ```
 
-- `row` and `col` are **0-indexed integers** in `[0, 9]`. `reasoning` is a short
-  human-readable string.
-- Where supported by the API, the app SHOULD constrain output using a
-  JSON/response schema to improve reliability; regardless, the app MUST still
-  validate the parsed result (defense in depth).
-- **Validation:** A response is **valid** only if it parses as JSON, contains
-  integer `row`/`col` within bounds, and targets a cell that has **not already
-  been fired upon**. Anything else is **invalid**.
+- `target` MUST be a coordinate label (`A1`–`J10`) copied **exactly** from the
+  candidate list. `reasoning` is a short human-readable string.
+- The parser MAY also accept legacy `{ "row": 0, "col": 0, "reasoning": "..." }`
+  with 0-indexed integers for robustness, but the constrained `target` form is
+  normative.
+- **Validation:** A response is **valid** only if it parses as JSON, includes
+  `reasoning`, resolves to a legal coordinate, the coordinate is in the current
+  candidate set, and the cell has **not already been fired upon**. Anything else
+  is **invalid**.
 
 ### 6.3 Session model
 
-- The app MUST create **one persistent `LanguageModel` session per match**,
-  seeded with the system prompt (rules, coordinate system, output contract, and
-  the enemy fleet sizes).
-- On each AI turn, the app sends **only the latest move result** (the outcome of
-  the AI's previous shot, e.g. "Your shot at C4 was a HIT" / "...MISS" /
-  "...SUNK the size-3 ship"). The session's own context carries prior history.
-- For the AI's **first shot** of the match there is no prior result; the prompt
-  asks for an opening move.
+- **Model download:** A separate warmup `LanguageModel.create()` call (with
+  `downloadprogress` monitoring) may run once after a user gesture to trigger
+  the on-device model download. That warmup session is destroyed immediately;
+  it is not used for gameplay.
+- **Match session:** The app MUST create **one persistent `LanguageModel`
+  session per match**, with:
+  - a system prompt (rules, coordinates, output contract, remaining ship sizes,
+    Hunt/Target strategy hints),
+  - optional `initialPrompts` replaying full shot history when restarting a
+    session ([6.6](#66-resilience--fallback)).
+- On **each AI shot**, the app sends a **full turn prompt** containing the fog
+  grid, forbidden cells, candidate list, recommended cell, tactical mode, and
+  the latest shot result (if any). Retry prompts append validation feedback.
+- The first shot uses the same turn-prompt shape; there is no separate
+  "opening move" prose-only prompt.
 
 ### 6.4 Reasoning transcript
 
@@ -217,12 +285,13 @@ every branch (see [6.7](#67-debug-logging)):
       one**, re-seeded with the system prompt **and the full board shot history**
       (all of the AI's prior shots and their results). Reset `consecutiveInvalid`
       to 0 and log the restart.
-    - If `attempts >= 5` (hard cap per shot): **fall back** to the
-      **Hunt/Target** algorithm ([5.1](#51-hunttarget-bot)) to choose a legal
-      move for this shot, log the fallback, and fire that move. The persistent
-      session is kept for subsequent shots (a single bad shot does not end AI
-      play).
-    - Otherwise: re-prompt (loop).
+    - If `attempts < MAX_ATTEMPTS_PER_MOVE`: re-prompt (loop).
+    - Else (`attempts` reached the cap): **fall back** to the **Hunt/Target**
+      algorithm ([5.1](#51-hunttarget-bot)) to choose a legal move for this
+      shot, log the fallback, and fire that move. The persistent session is kept
+      for subsequent shots (a single bad shot does not end AI play).
+- If the session throws `InvalidStateError` (destroyed), recreate the match
+  session with full history and retry the same prompt once.
 
 Thresholds (confirmed defaults; treated as named constants in the spec):
 
@@ -232,15 +301,15 @@ Thresholds (confirmed defaults; treated as named constants in the spec):
 ```mermaid
 flowchart TD
   startTurn[AI shot begins] --> ask[Request move from session]
-  ask --> parse{Valid JSON and legal cell?}
-  parse -->|yes| fire[Fire shot, show reasoning, reset counters]
+  ask --> parse{Valid JSON and legal candidate?}
+  parse -->|yes| fire[Fire shot, show reasoning, reset consecutiveInvalid]
   parse -->|no| log[Debug-log invalid response]
   log --> consec{consecutiveInvalid >= 2?}
-  consec -->|yes| fresh[Discard session; fresh session seeded with full history; log]
-  consec -->|no| cap{attempts >= 5?}
-  fresh --> cap
-  cap -->|no| ask
-  cap -->|yes| fb[Hunt/Target fallback move; log]
+  consec -->|yes| fresh[Discard session; fresh session with full history; log]
+  consec -->|no| more{attempts < 5?}
+  fresh --> more
+  more -->|yes| ask
+  more -->|no| fb[Hunt/Target fallback move; log]
   fb --> fire
 ```
 
@@ -250,9 +319,11 @@ flowchart TD
   redactable summary), each raw model response, every validation failure with its
   reason, every fresh-session restart (with the reason and history size), and
   every fallback (with the chosen fallback cell).
-- Debug logs are developer-facing (console and/or an in-app debug panel) and are
-  separate from the player-facing transcript ([6.4](#64-reasoning-transcript)).
-- Logs MUST NOT block gameplay and SHOULD be throttle-safe.
+- Debug logs are **developer-facing only** (browser `console`; no in-app debug
+  panel) and are separate from the player-facing transcript
+  ([6.4](#64-reasoning-transcript)).
+- Logs MUST NOT block gameplay and SHOULD be throttle-safe (ring buffer capped,
+  e.g. 200 entries).
 
 ---
 
@@ -268,8 +339,11 @@ flowchart TD
   - `downloadable` - supported but the model must be downloaded first.
   - `downloading` - a download is in progress.
   - `unavailable` - not supported on this browser/device.
-- `availability()` MUST be called with the **same options** the app will later
-  pass to `create()`/`prompt()` so the result is accurate.
+- `availability()` SHOULD be called with options consistent with later
+  `create()`/`prompt()` calls. The implementation uses a minimal probe
+  (`LanguageModel.availability({ systemPrompt: '' })`) on load; full
+  `systemPrompt`, `initialPrompts`, and per-turn `responseConstraint` are applied
+  at session creation and prompt time.
 
 ### 7.2 Download flow
 
@@ -327,9 +401,9 @@ The screen MUST present:
 - **Two boards:** the player's board (ships visible) and the enemy board shown as
   **fog** (only the player's own shot results revealed).
 - **Opponent picker** with availability states ([Section 4](#4-opponent-selection)).
-- **AI transcript/log panel** showing the AI's reasoning per move
-  ([Section 6.4](#64-reasoning-transcript)); when a conventional bot is selected
-  this panel MAY show a simple move log or be hidden.
+- **Transcript/log panel:** for AI-Nano, shows reasoning and system events
+  ([Section 6.4](#64-reasoning-transcript)); for conventional bots, shows a
+  simple **Move Log** (coordinate + result per shot).
 - **Status / turn indicator:** whose turn it is, last result, and end-of-match
   result.
 - **Controls:** placement controls (rotate/randomize/clear/start), new-match /
@@ -349,8 +423,9 @@ The screen MUST present:
   conventional bots remain available on mobile.
 - **Sound effects:** Fire, hit, miss, sink, win/lose cues with a **mute toggle**
   (state persisted, see [Section 11](#11-persistence)).
-- **Animations:** Hit, miss, and sink animations on the boards (respecting
-  `prefers-reduced-motion`).
+- **Animations:** Hit, miss, and sink animations on the boards. Animations MUST
+  be skipped when the user agent reports `prefers-reduced-motion: reduce` (read
+  at app startup; not a separate in-app toggle).
 - **Per-match stats:** Track and display shots fired, hits, accuracy, and turns
   taken (per side), shown during and at end of match.
 
@@ -360,8 +435,9 @@ The screen MUST present:
 
 - Persist **settings only** in `localStorage`:
   - last selected opponent type,
-  - mute/sound preference,
-  - (optionally) reduced-motion or other UI preferences.
+  - mute/sound preference.
+- Reduced motion follows the system `prefers-reduced-motion` media query at
+  startup (not persisted as a user-facing setting).
 - In-progress match state MUST NOT be persisted; reloading starts a fresh setup.
 - A remembered AI-Nano opponent choice MUST fall back to a conventional bot if
   AI is unavailable on load.
@@ -397,8 +473,10 @@ concrete code):
 - **GamePhase:** `setup` | `playing` | `finished`, plus whose turn it is.
 - **OpponentType:** `huntTarget` | `probability` | `aiNano`.
 - **AI session state:** handle to the persistent `LanguageModel` session, plus
-  `attempts` and `consecutiveInvalid` counters and the AI's own shot history
-  (for fresh-session re-seeding).
+  per-shot `attempts` and `consecutiveInvalid` counters, tactical candidate
+  context, and the AI's own shot history (for fresh-session re-seeding).
+- **TacticalContext:** mode (`hunt`|`target`), candidate coordinates, primary
+  recommendation, forbidden labels, fog grid string.
 - **Availability state:** `available` | `downloadable` | `downloading` |
   `unavailable`, plus download progress.
 - **Stats:** per side - shots, hits, accuracy, turns.
